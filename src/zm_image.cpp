@@ -104,13 +104,13 @@ Image::Image( int p_width, int p_height, int p_colours, int p_subpixelorder, uin
     pixels = width*height;
     colours = p_colours;
     subpixelorder = p_subpixelorder;
-    size = (width*height)*colours;
+    size = pixels*colours;
     buffer = 0;
     holdbuffer = 0;
     if ( p_buffer )
     {
-	allocation = size;
-	buffertype = ZM_BUFTYPE_DONTFREE;
+		allocation = size;
+		buffertype = ZM_BUFTYPE_DONTFREE;
         buffer = p_buffer;
     }
     else
@@ -129,10 +129,10 @@ Image::Image( const Image &p_image )
     pixels = p_image.pixels;
     colours = p_image.colours;
     subpixelorder = p_image.subpixelorder;
-    size = allocation = p_image.size;
+    size = p_image.size; // allocation is set in AllocImgBuffer
     buffer = 0;
     holdbuffer = 0;
-    AllocImgBuffer(allocation);
+    AllocImgBuffer(size);
     (*fptr_imgbufcpy)(buffer, p_image.buffer, size);
     strncpy( text, p_image.text, sizeof(text) );
 }
@@ -140,6 +140,22 @@ Image::Image( const Image &p_image )
 Image::~Image()
 {
 	DumpImgBuffer();
+	if ( initialised )
+	{
+		delete[] y_table;
+		delete[] uv_table;
+		delete[] r_v_table;
+		delete[] g_v_table;
+		delete[] g_u_table;
+		delete[] b_u_table;
+		initialised = false;
+	}
+	if ( jpg_dcinfo )
+	{
+		jpeg_destroy_decompress( jpg_dcinfo );
+		delete jpg_dcinfo;
+		jpg_dcinfo = 0;
+	}
 }
 
 void Image::Initialise()
@@ -289,7 +305,7 @@ void Image::Initialise()
 	initialised = true;
 }
 
-/* Requests a writeable buffer to the image. This is safer than buffer() because this way we can gurantee that a buffer of required size exists */
+/* Requests a writeable buffer to the image. This is safer than buffer() because this way we can guarantee that a buffer of required size exists */
 uint8_t* Image::WriteBuffer(const unsigned int p_width, const unsigned int p_height, const unsigned int p_colours, const unsigned int p_subpixelorder) {
 	unsigned int newsize;
   
@@ -315,7 +331,7 @@ uint8_t* Image::WriteBuffer(const unsigned int p_width, const unsigned int p_hei
 					return NULL;
 				} else {
 					/* Replace buffer with a bigger one */
-					DumpImgBuffer();
+					//DumpImgBuffer(); // Done in AllocImgBuffer too
 					AllocImgBuffer(newsize);
 				}
 			}
@@ -339,24 +355,26 @@ void Image::AssignDirect( const unsigned int p_width, const unsigned int p_heigh
 		Error("Attempt to directly assign buffer from a NULL pointer");
 		return;
 	}
-	
-	if(buffer_size < (unsigned int)((p_width*p_height)*p_colours)) {
-		Error("Attempt to directly assign buffer from an undersized buffer of size: %zu",buffer_size);
-		return;
-	}
-	
+
 	if(!p_height || !p_width) {
 		Error("Attempt to directly assign buffer with invalid width or height: %d %d",p_width,p_height);
 		return;
 	}
-	
+
 	if(p_colours != ZM_COLOUR_GRAY8 && p_colours != ZM_COLOUR_RGB24 && p_colours != ZM_COLOUR_RGB32) {
 		Error("Attempt to directly assign buffer with unexpected colours per pixel: %d",p_colours);
 		return;
 	}
+
+	unsigned int new_buffer_size = ((p_width*p_height)*p_colours);
+	
+	if(buffer_size < new_buffer_size) {
+		Error("Attempt to directly assign buffer from an undersized buffer of size: %zu, needed %dx%d*%d colours = %zu",buffer_size, p_width, p_height, p_colours, new_buffer_size );
+		return;
+	}
 	
 	if(holdbuffer && buffer) {
-		if((unsigned int)((p_height*p_width)*p_colours) > allocation) {
+		if(new_buffer_size > allocation) {
 			Error("Held buffer is undersized for assigned buffer");
 			return;
 		} else {
@@ -365,7 +383,7 @@ void Image::AssignDirect( const unsigned int p_width, const unsigned int p_heigh
 			colours = p_colours;
 			subpixelorder = p_subpixelorder;
 			pixels = height*width;
-			size = pixels*colours;
+			size = new_buffer_size; // was pixels*colours, but we already calculated it above as new_buffer_size
 			
 			/* Copy into the held buffer */
 			if(new_buffer != buffer)
@@ -383,7 +401,7 @@ void Image::AssignDirect( const unsigned int p_width, const unsigned int p_heigh
 		colours = p_colours;
 		subpixelorder = p_subpixelorder;
 		pixels = height*width;
-		size = pixels*colours;
+		size = new_buffer_size; // was pixels*colours, but we already calculated it above as new_buffer_size
 	
 		allocation = buffer_size;
 		buffertype = p_buffertype;
@@ -464,7 +482,7 @@ void Image::Assign( const Image &image ) {
 			}
 		} else {
 			if(new_size > allocation || !buffer) { 
-				DumpImgBuffer();
+				// DumpImgBuffer(); This is also done in AllocImgBuffer
 				AllocImgBuffer(new_size);
 			}
 		}
@@ -1562,7 +1580,11 @@ Image *Image::Highlight( unsigned int n_images, Image *images[], const Rgb thres
 			{
 				uint8_t *psrc = images[j]->buffer+c;
 
+#ifndef SOLARIS
 				if ( (unsigned)abs((*psrc)-RGB_VAL(ref_colour,c)) >= RGB_VAL(threshold,c) )
+#else
+				if ( (unsigned)std::abs((*psrc)-RGB_VAL(ref_colour,c)) >= RGB_VAL(threshold,c) )
+#endif
 				{
 					count++;
 				}
@@ -1575,7 +1597,7 @@ Image *Image::Highlight( unsigned int n_images, Image *images[], const Rgb thres
 	return( result );
 }
 
-/* New function to allow buffer re-using instead of allocationg memory for the delta image everytime */
+/* New function to allow buffer re-using instead of allocationg memory for the delta image every time */
 void Image::Delta( const Image &image, Image* targetimage) const
 {
 #ifdef ZM_IMAGE_PROFILING

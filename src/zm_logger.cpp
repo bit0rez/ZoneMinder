@@ -31,6 +31,9 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <errno.h>
+#ifdef __FreeBSD__
+#include <sys/thr.h>
+#endif
 
 bool Logger::smInitialised = false;
 Logger *Logger::smInstance = 0;
@@ -239,6 +242,9 @@ void Logger::terminate()
 
     if ( mSyslogLevel > NOLOG )
         closeSyslog();
+
+    if ( mDatabaseLevel > NOLOG )
+        closeDatabase();
 }
 
 bool Logger::boolEnv( const std::string &name, bool defaultValue )
@@ -468,6 +474,15 @@ void Logger::closeFile()
     }
 }
 
+void Logger::closeDatabase()
+{
+    if ( mDbConnected )
+    {
+        mysql_close( &mDbConnection );
+        mDbConnected = false;
+    }
+}
+
 void Logger::openSyslog()
 {
     (void) openlog( mId.c_str(), LOG_PID|LOG_NDELAY, LOG_LOCAL1 );
@@ -515,9 +530,25 @@ void Logger::logPrint( bool hex, const char * const file, const int line, const 
     #endif
 
         pid_t tid;
+#ifdef __FreeBSD__
+       long lwpid;
+       thr_self(&lwpid);
+       tid = lwpid;
+
+        if (tid < 0 ) // Thread/Process id
+#else
 #ifdef HAVE_SYSCALL
+	#ifdef __FreeBSD_kernel__
+        if ( (syscall(SYS_thr_self, &tid)) < 0 ) // Thread/Process id
+
+	# else
+	// SOLARIS doesn't have SYS_gettid; don't assume
+        #ifdef SYS_gettid
         if ( (tid = syscall(SYS_gettid)) < 0 ) // Thread/Process id
+        #endif // SYS_gettid
+	#endif
 #endif // HAVE_SYSCALL
+#endif
         tid = getpid(); // Process id
 
         char *logPtr = logString;
@@ -604,5 +635,6 @@ void logInit( const char *name, const Logger::Options &options )
 
 void logTerm()
 {
-    Logger::fetch()->terminate();
+    if ( Logger::smInstance )
+        delete Logger::smInstance;
 }

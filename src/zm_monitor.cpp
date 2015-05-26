@@ -55,6 +55,11 @@
 #include <sys/shm.h>
 #endif // ZM_MEM_MAPPED
 
+// SOLARIS - we don't have MAP_LOCKED on openSolaris/illumos
+#ifndef MAP_LOCKED
+#define MAP_LOCKED 0
+#endif
+
 //=============================================================================
 std::vector<std::string> split(const std::string &s, char delim) {
     std::vector<std::string> elems;
@@ -251,7 +256,6 @@ bool Monitor::MonitorLink::hasAlarmed()
     else if( shared_data->last_event != (unsigned int)last_event )
     {
         last_event = shared_data->last_event;
-        return( true );
     }
     return( false );
 }
@@ -317,7 +321,9 @@ Monitor::Monitor(
     last_motion_score(0),
     camera( p_camera ),
     n_zones( p_n_zones ),
-    zones( p_zones )
+    zones( p_zones ),
+    timestamps( 0 ),
+    images( 0 )
 {
     strncpy( name, p_name, sizeof(name) );
 
@@ -416,16 +422,16 @@ Monitor::Monitor(
     {
         if ( purpose != QUERY )
         {
-            Error( "Shared data not initialised by capture daemon" );
+            Error( "Shared data not initialised by capture daemon for monitor %s", name );
             exit( -1 );
         }
         else
         {
-            Warning( "Shared data not initialised by capture daemon, some query functions may not be available or produce invalid results" );
+            Warning( "Shared data not initialised by capture daemon, some query functions may not be available or produce invalid results for monitor %s", name );
         }
     }
 
-	// Will this not happen everytime a monitor is instantiated?  Seems like all the calls to the Monitor constructor pass a zero for n_zones, then load zones after..
+	// Will this not happen every time a monitor is instantiated?  Seems like all the calls to the Monitor constructor pass a zero for n_zones, then load zones after..
     if ( !n_zones ) {
 		Debug( 1, "Monitor %s has no zones, adding one.", name );
         n_zones = 1;
@@ -514,14 +520,18 @@ bool Monitor::connect() {
         Error( "Got unexpected memory map file size %ld, expected %d", map_stat.st_size, mem_size );
 		return false;
 	} else {
+#ifdef MAP_LOCKED
 		mem_ptr = (unsigned char *)mmap( NULL, mem_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_LOCKED, map_fd, 0 );
 		if ( mem_ptr == MAP_FAILED ) {
 			if ( errno == EAGAIN ) {
 				Debug( 1, "Unable to map file %s (%d bytes) to locked memory, trying unlocked", mem_file, mem_size );
+#endif
 				mem_ptr = (unsigned char *)mmap( NULL, mem_size, PROT_READ|PROT_WRITE, MAP_SHARED, map_fd, 0 );
 				Debug( 1, "Mapped file %s (%d bytes) to locked memory, unlocked", mem_file, mem_size );
+#ifdef MAP_LOCKED
 			}
 		}
+#endif
 		if ( mem_ptr == MAP_FAILED )
 			Fatal( "Can't map file %s (%d bytes) to memory: %s(%d)", mem_file, mem_size, strerror(errno), errno );
     }
@@ -567,6 +577,14 @@ bool Monitor::connect() {
 
 Monitor::~Monitor()
 {
+	if ( timestamps ) {
+		delete[] timestamps;
+		timestamps = 0;
+	}
+	if ( images ) {
+		delete[] images;
+		images = 0;
+	}
 	if ( mem_ptr ) {
 		if ( event )
 			Info( "%s: %03d - Closing event %d, shutting down", name, image_count, event->Id() );
@@ -1234,8 +1252,6 @@ bool Monitor::Analyse()
     }
 
     static bool static_undef = true;
-    static struct timeval **timestamps;
-    static Image **images;
     static int last_section_mod = 0;
     static bool last_signal;
 
@@ -2862,7 +2878,7 @@ int Monitor::Capture()
 
         if ( capture_image->Size() != camera->ImageSize() )
         {
-            Error( "Captured image does not match expected size, check width, height and colour depth" );
+			Error( "Captured image %d does not match expected size %d check width, height and colour depth",capture_image->Size(),camera->ImageSize() );
             return( -1 );
         }
 
@@ -2999,7 +3015,7 @@ bool Monitor::closeEvent()
  * comparing it with ZM_COLOUR_RGB24 or ZM_COLOUR_RGB32 is the way ), and then
  * manage che check using RGB_VAL_RED() and so on macros instead of just RED().
  *
- * Be carefull that in 32 bit images we need to check also where the alpha channel is, so,
+ * Be careful that in 32 bit images we need to check also where the alpha channel is, so,
  * (RGBA and BGRA) or (ABGR and ARGB) aren't the same!
  *
  * To check black pixels in 32 bit images i can do a more efficient way using 
@@ -3932,38 +3948,38 @@ void MonitorStream::runStream()
     temp_read_index = temp_image_buffer_count;
     temp_write_index = temp_image_buffer_count;
 
-    char swap_path[PATH_MAX] = "";
+    char *swap_path = 0;
     bool buffered_playback = false;
+	int swap_path_length = strlen(config.path_swap)+1; // +1 for NULL terminator
 
-    if ( connkey && playback_buffer > 0 )
-    {
-        Debug( 2, "Checking swap image location" );
-        Debug( 3, "Checking swap image path" );
-        strncpy( swap_path, config.path_swap, sizeof(swap_path) );
-        if ( checkSwapPath( swap_path, false ) )
-        {
-            snprintf( &(swap_path[strlen(swap_path)]), sizeof(swap_path)-strlen(swap_path), "/zmswap-m%d", monitor->Id() );
-            if ( checkSwapPath( swap_path, true ) )
-            {
-                snprintf( &(swap_path[strlen(swap_path)]), sizeof(swap_path)-strlen(swap_path), "/zmswap-q%06d", connkey );
-                if ( checkSwapPath( swap_path, true ) )
-                {
-                    buffered_playback = true;
-                }
-            }
-        }
+	if ( connkey && playback_buffer > 0 ) {
 
-        if ( !buffered_playback )
-        {
-            Error( "Unable to validate swap image path, disabling buffered playback" );
-        }
-        else
-        {
-            Debug( 2, "Assigning temporary buffer" );
-            temp_image_buffer = new SwapImage[temp_image_buffer_count];
-            memset( temp_image_buffer, 0, sizeof(*temp_image_buffer)*temp_image_buffer_count );
-            Debug( 2, "Assigned temporary buffer" );
-        }
+		if ( swap_path_length + 15 > PATH_MAX ) {
+			// 15 is for /zmswap-whatever, assuming max 6 digits for monitor id
+			Error( "Swap Path is too long. %d > %d ", swap_path_length+15, PATH_MAX );
+		} else {
+			swap_path = (char *)malloc( swap_path_length+15 );
+			Debug( 3, "Checking swap image path %s", config.path_swap );
+			strncpy( swap_path, config.path_swap, swap_path_length );
+			if ( checkSwapPath( swap_path, false ) ) {
+				snprintf( &(swap_path[swap_path_length]), sizeof(swap_path)-swap_path_length, "/zmswap-m%d", monitor->Id() );
+				if ( checkSwapPath( swap_path, true ) ) {
+					snprintf( &(swap_path[swap_path_length]), sizeof(swap_path)-swap_path_length, "/zmswap-q%06d", connkey );
+					if ( checkSwapPath( swap_path, true ) ) {
+						buffered_playback = true;
+					}
+				}
+			}
+
+			if ( !buffered_playback ) {
+				Error( "Unable to validate swap image path, disabling buffered playback" );
+			} else {
+				Debug( 2, "Assigning temporary buffer" );
+				temp_image_buffer = new SwapImage[temp_image_buffer_count];
+				memset( temp_image_buffer, 0, sizeof(*temp_image_buffer)*temp_image_buffer_count );
+				Debug( 2, "Assigned temporary buffer" );
+			}
+		}
     }
 
     float max_secs_since_last_sent_frame = 10.0; //should be > keep alive amount (5 secs)
@@ -4201,6 +4217,7 @@ void MonitorStream::runStream()
             }
         }
     }
+	if ( swap_path ) free( swap_path );
     closeComms();
 }
 
